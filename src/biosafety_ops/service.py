@@ -5,8 +5,18 @@ from .auth import Auth
 from .models import MonitoringRecord,ZoneRecord,as_dict,utcnow
 from .risk import violation_probability,score_monitoring_record
 from .storage import audit,connect,rows,transaction
+try:
+    from qualification_ledger.gate import GateDenied, PermissiveGate
+except ImportError:
+    class GateDenied(RuntimeError):
+        pass
+    class PermissiveGate:
+        def check(self,*a,**k): return {"approved": True, "permissive": True}
 class BiosafetyService:
-    def __init__(self,database=":memory:"): self.db=connect(database); self.auth=Auth(self.db)
+    def __init__(self,database=":memory:",gate=None): self.db=connect(database); self.auth=Auth(self.db); self.gate=gate or PermissiveGate()
+    def _gate(self,actor,action,business_ref,idempotency_key=None,business_at=None):
+        try: self.gate.check(actor.user_id,action,business_ref,business_at or utcnow(),idempotency_key)
+        except GateDenied as exc: raise PermissionError(str(exc)) from exc
     def bootstrap(self):
         for uid,pwd,role in (("admin","biosafety-admin","admin"),("operator","biosafety-operator","operator")):
             try:self.auth.create_user(uid,pwd,role)
@@ -51,6 +61,8 @@ class BiosafetyService:
             row=self.db.execute("SELECT status FROM treatment_tickets WHERE treatment_ticket_id=?",(treatment_ticket_id,)).fetchone()
             if not row:raise KeyError(treatment_ticket_id)
             if target not in allowed.get(row[0],set()):raise ValueError("invalid work order transition")
+            # 关键动作：状态机允许流转时，在写入前核对处置资格（每次尝试独立裁决）。
+            self._gate(actor,"risk_handling",f"treatment_ticket:{treatment_ticket_id}",f"transition:{treatment_ticket_id}:{target}:{uuid.uuid4().hex[:16]}")
             self.db.execute("UPDATE treatment_tickets SET status=?,updated_at=? WHERE treatment_ticket_id=?",(target,utcnow(),treatment_ticket_id)); audit(self.db,"treatment_ticket",treatment_ticket_id,"transition",actor.user_id,{"from":row[0],"to":target,"reason":reason})
         return self.treatment_ticket(token,treatment_ticket_id)
     def add_preservation_resource(self,token,preservation_resource_id,kind,collection_zone,capacity):
@@ -73,6 +85,8 @@ class BiosafetyService:
             if preservation_resource[0]<quantity:raise ValueError("preservation_resource capacity exceeded")
             old=self.db.execute("SELECT plan_id FROM allocations WHERE preservation_resource_id=? AND treatment_ticket_id=?",(preservation_resource_id,treatment_ticket_id)).fetchone()
             if old:return {"plan_id":old[0],"duplicate":True}
+            # 关键动作：业务约束通过后、写入前核对调拨资格（每次尝试独立裁决）。
+            self._gate(actor,"resource_allocation",f"allocation:{preservation_resource_id}:{treatment_ticket_id}",f"alloc:{uuid.uuid4().hex[:16]}")
             self.db.execute("INSERT INTO allocations VALUES(?,?,?,?,?)",(aid,preservation_resource_id,treatment_ticket_id,quantity,utcnow())); self.db.execute("UPDATE preservation_resources SET available=available-? WHERE preservation_resource_id=?",(quantity,preservation_resource_id)); audit(self.db,"preservation_resource",preservation_resource_id,"allocated",actor.user_id,{"treatment_ticket_id":treatment_ticket_id,"quantity":quantity})
         return {"plan_id":aid,"duplicate":False,"preservation_resource_id":preservation_resource_id,"quantity":quantity}
     def audit_events(self,token,entity_type,entity_id): self.auth.require(token,"read"); return rows(self.db,"SELECT * FROM audit_events WHERE entity_type=? AND entity_id=? ORDER BY event_id",(entity_type,entity_id))

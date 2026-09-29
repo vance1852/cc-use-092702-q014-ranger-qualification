@@ -115,7 +115,11 @@ class JsonApplication:
                 )
                 return Response(200, result)
             if method == "POST" and path == "/jobs/claim":
-                result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
+                result = self.service.claim_job(
+                    payload["worker_id"],
+                    int(payload.get("lease_seconds", 60)),
+                    payload.get("task_kind", "wildlife_rescue"),
+                )
                 return Response(200, {"job": result})
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(

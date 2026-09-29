@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
@@ -14,6 +15,16 @@ from .contracts import EvidenceItem, EvidenceProtocol, ValidationError
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
+
+try:
+    from qualification_ledger.gate import GateDenied, PermissiveGate
+except ImportError:  # 脱离联合部署时保持本服务独立可用
+    class GateDenied(RuntimeError):  # type: ignore[no-redef]
+        pass
+
+    class PermissiveGate:  # type: ignore[no-redef]
+        def check(self, *args: object, **kwargs: object) -> dict[str, object]:
+            return {"approved": True, "permissive": True}
 
 
 ROLE_PERMISSIONS = {
@@ -30,10 +41,18 @@ ROLE_PERMISSIONS = {
 class TaxonomyLabService:
     """在单个 SQLite 连接上提供全部业务操作。"""
 
-    def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
+    def __init__(self, connection: sqlite3.Connection, clock=None, gate=None) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
+        self.gate = gate or PermissiveGate()
         initialize(connection)
+
+    def _gate(self, person_id: str, action: str, business_ref: str,
+              business_at: str | None = None, idempotency_key: str | None = None) -> None:
+        try:
+            self.gate.check(person_id, action, business_ref, business_at, idempotency_key)
+        except GateDenied as exc:
+            raise Forbidden(str(exc)) from exc
 
     def _now(self) -> str:
         return isoformat(self.clock.now())
@@ -362,9 +381,11 @@ class TaxonomyLabService:
             self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
         return self.get_batch(batch_id)
 
-    def claim_job(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+    def claim_job(self, worker_id: str, lease_seconds: int = 60, task_kind: str = "wildlife_rescue") -> dict[str, Any] | None:
         if lease_seconds <= 0:
             raise ValidationFailed("租约时长必须大于零")
+        if task_kind not in {"forest_fire", "wildlife_rescue", "high_altitude_night_patrol"}:
+            raise ValidationFailed("未知任务线")
         now = self._now()
         expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
         with transaction(self.connection, immediate=True):
@@ -376,6 +397,14 @@ class TaxonomyLabService:
             ).fetchone()
             if row is None:
                 return None
+            # 关键动作：任务领取时刻核对对应任务线资格。
+            self._gate(
+                worker_id,
+                f"task_claim.{task_kind}",
+                f"analysis_job:{row['job_id']}",
+                now,
+                f"claim:{row['job_id']}:{worker_id}:{now}:{uuid.uuid4().hex[:12]}",
+            )
             self.connection.execute(
                 "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,updated_at=? "
                 "WHERE job_id=?",
@@ -495,6 +524,15 @@ class TaxonomyLabService:
         batch = self.get_batch(batch_id)
         if batch["state"] != "analyzed" or batch["revision"] != analysis_row["batch_revision"]:
             raise InvalidState("分析不是批次当前可审批版本")
+        # 关键动作：样本复核（采信决定）时刻核对复核资格。
+        decision_moment = self._now()
+        self._gate(
+            actor_id,
+            "sample_review",
+            f"batch:{batch_id}:analysis:{analysis_id}",
+            decision_moment,
+            f"decision:{batch_id}:{analysis_id}:{actor_id}:{decision_moment}:{uuid.uuid4().hex[:12]}",
+        )
         try:
             with transaction(self.connection, immediate=True):
                 cursor = self.connection.execute(

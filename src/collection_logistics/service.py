@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
@@ -29,6 +30,16 @@ from .planning import (
 )
 from .storage import initialize, transaction
 
+try:
+    from qualification_ledger.gate import GateDenied, PermissiveGate
+except ImportError:  # 脱离联合部署时保持本服务独立可用
+    class GateDenied(RuntimeError):  # type: ignore[no-redef]
+        pass
+
+    class PermissiveGate:  # type: ignore[no-redef]
+        def check(self, *args: object, **kwargs: object) -> dict[str, object]:
+            return {"approved": True, "permissive": True}
+
 
 ROLE_PERMISSIONS = {
     "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run"},
@@ -39,10 +50,18 @@ ROLE_PERMISSIONS = {
 
 
 class CollectionLogisticsService:
-    def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
+    def __init__(self, connection: sqlite3.Connection, clock=None, gate=None) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
+        self.gate = gate or PermissiveGate()
         initialize(connection)
+
+    def _gate(self, person_id: str, action: str, business_ref: str,
+              business_at: str | None = None, idempotency_key: str | None = None) -> None:
+        try:
+            self.gate.check(person_id, action, business_ref, business_at, idempotency_key)
+        except GateDenied as exc:
+            raise Forbidden(str(exc)) from exc
 
     def _now(self) -> str:
         return utc_text(self.clock.now())
@@ -433,6 +452,15 @@ class CollectionLogisticsService:
             raise Conflict("应急资源库存不足以完成分配")
         expected_delivery = delivered_after_loss(allocated, int(dispatch_request["delay_basis_points"]))
         departed_at = self._now()
+        # 关键动作：应急资源调拨到场时刻核对调拨资格（每次尝试独立裁决；
+        # 调度单版本约束保证同一版本不会重复到场）。
+        self._gate(
+            actor_id,
+            "resource_allocation",
+            f"dispatch:{dispatch_id}",
+            departed_at,
+            f"deployment:{deployment_id}:{uuid.uuid4().hex[:16]}",
+        )
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE preservation_resource_lots SET available_units=?,revision=revision+1 WHERE preservation_resource_lot_id=? AND revision=?",
