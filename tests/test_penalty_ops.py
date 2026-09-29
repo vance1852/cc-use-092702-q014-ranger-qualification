@@ -1,10 +1,19 @@
 import unittest
+from datetime import datetime, timezone
 from biosafety_ops.models import MonitoringRecord,ZoneRecord
 from biosafety_ops.risk import score_monitoring_record
 from biosafety_ops.service import BiosafetyService
+from qualification_ledger import FrozenClock
+def grant_fire(s,token,user,valid_from="2026-09-01T00:00:00Z"):
+    s.record_qualification_event(token,{"user_id":user,"event_type":"training_passed","competency_code":"forest-firefighting","scope":"forest-fire-basic","valid_from":valid_from,"idempotency_key":f"{user}-train"})
+    s.record_qualification_event(token,{"user_id":user,"event_type":"medical_passed","competency_code":"forest-firefighting","scope":"fire-ground","valid_from":valid_from,"idempotency_key":f"{user}-med"})
+    for scope in ("fire-suit","breathing-apparatus"):
+        s.record_qualification_event(token,{"user_id":user,"event_type":"equipment_authorized","competency_code":"forest-firefighting","scope":scope,"valid_from":valid_from,"idempotency_key":f"{user}-equip-{scope}"})
 class BiosafetyOperationsTests(unittest.TestCase):
     def setUp(self):
-        self.s=BiosafetyService(); self.s.bootstrap(); self.t=self.s.auth.login("admin","biosafety-admin"); self.s.register_zone_record(self.t,ZoneRecord("S1","east","quarantine",100,4))
+        self.s=BiosafetyService(clock=FrozenClock(datetime(2026,9,24,8,0,tzinfo=timezone.utc))); self.s.bootstrap(); self.t=self.s.auth.login("admin","biosafety-admin"); self.s.register_zone_record(self.t,ZoneRecord("S1","east","quarantine",100,4))
+        # 处置人 crew 与调拨人 admin 均持有有效森林消防资格。
+        grant_fire(self.s,self.t,"crew"); grant_fire(self.s,self.t,"admin")
     def test_risk_and_idempotent_monitoring_record(self):
         r=MonitoringRecord("R1","S1","sensor_source",120,250,90,"2026-01-01T00:00:00+00:00"); a=self.s.ingest_monitoring_record(self.t,r); b=self.s.ingest_monitoring_record(self.t,r); self.assertFalse(a["duplicate"]); self.assertTrue(b["duplicate"]); self.assertEqual(self.s.risk_report(self.t,"S1")["monitoring_records"],1)
     def test_treatment_ticket_and_allocation(self):

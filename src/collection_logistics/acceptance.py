@@ -18,6 +18,12 @@ def run(workspace: Path) -> dict[str, object]:
     service = CollectionLogisticsService(connection, FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)))
     for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
         service.create_user(user_id, user_id, role)
+    # 资源调拨要求调拨人持有与资源类型匹配的资格（preservation-box -> 样本复核）。
+    service.record_qualification_event("risk", {
+        "user_id": "dispatch", "event_type": "training_passed",
+        "competency_code": "specimen-review", "scope": "taxonomy-review-basic",
+        "valid_from": "2026-09-20T00:00:00Z", "idempotency_key": "dispatch-review-train",
+    })
     for index, close in enumerate(("108", "105", "102", "100", "98", "96"), start=18):
         service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": f"2026-09-{index}", "index_value": close, "source_revision": f"rev-{index}", "observed_at": f"2026-09-{index}T21:00:00Z"})
     service.create_facility("plan", {"center_id": "collection-east", "name": "北部标本事件保藏中心", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_units": "500000"})
@@ -30,7 +36,7 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_scenario("plan", {"scenario_id": "storage-recovery", "name": "主干路恢复通行与标本事件需求回落", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
     service.approve_scenario("risk", "storage-recovery", 1)
     scenario = service.run_scenario("plan", "storage-recovery", "2026-09-23")
-    result = {"status": "ok", "index": service.risk_summary("HUMIDITY"), "plan_id": allocation["plan_id"], "deployment": deployment, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    result = {"status": "ok", "index": service.risk_summary("HUMIDITY"), "plan_id": allocation["plan_id"], "deployment": deployment, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "qualification_chain": service.qualification_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

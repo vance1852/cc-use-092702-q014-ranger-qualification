@@ -32,6 +32,13 @@ def run(workspace: Path) -> dict[str, object]:
             service.register_device("operator-1", "scope-a", "A 型标本事件实验采集设备", "示例设备供应商")
             service.register_build("operator-1", "build-a1", "scope-a", "1.0.0", "a" * 64)
             service.publish_evidence_protocol("stat-1", evidence_protocol)
+            # 任务领取与样本复核要求持有样本复核培训资格（不可变资格事件账本）。
+            for worker in ("worker-1", "stat-1"):
+                service.record_qualification_event("stat-1", {
+                    "user_id": worker, "event_type": "training_passed",
+                    "competency_code": "specimen-review", "scope": "taxonomy-review-basic",
+                    "valid_from": "2026-09-20T00:00:00Z", "idempotency_key": f"{worker}-review-train",
+                })
             service.create_batch("operator-1", "batch-demo", evidence_protocol["evidence_protocol_id"], evidence_protocol["version"], "build-a1")
             service.start_batch("operator-1", "batch-demo", 1)
             imported = service.import_evidence_items(
@@ -47,6 +54,7 @@ def run(workspace: Path) -> dict[str, object]:
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
             )
             report = service.report("auditor-1", "batch-demo")
+            qualification_chain = service.qualification_chain("auditor-1")
             schema = inspect_schema(connection)
         finally:
             connection.close()
@@ -61,6 +69,7 @@ def run(workspace: Path) -> dict[str, object]:
         "conclusion": analysis["result"]["conclusion"],
         "decision": report["decision"]["decision"],
         "event_count": len(report["events"]),
+        "qualification_chain": qualification_chain,
         "schema": schema,
     }
 

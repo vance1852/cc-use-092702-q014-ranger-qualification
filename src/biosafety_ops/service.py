@@ -1,14 +1,25 @@
 """协调转运生物安全监测、告警、工单和应急资源分配的应用服务。"""
 from __future__ import annotations
 import hashlib,uuid
+from qualification_ledger import (
+    FrozenClock,
+    QualificationLedger,
+    SystemClock,
+    utc_text,
+)
 from .auth import Auth
 from .models import MonitoringRecord,ZoneRecord,as_dict,utcnow
 from .risk import violation_probability,score_monitoring_record
 from .storage import audit,connect,rows,transaction
 class BiosafetyService:
-    def __init__(self,database=":memory:"): self.db=connect(database); self.auth=Auth(self.db)
+    def __init__(self,database=":memory:",clock=None):
+        self.db=connect(database); self.auth=Auth(self.db)
+        self.clock=clock or SystemClock(); self.ledger=QualificationLedger(self.db,self.clock)
+    def set_clock(self,clock):
+        self.clock=clock; self.ledger.set_clock(clock)
+    def _moment(self): return utc_text(self.clock.now())
     def bootstrap(self):
-        for uid,pwd,role in (("admin","biosafety-admin","admin"),("operator","biosafety-operator","operator")):
+        for uid,pwd,role in (("admin","biosafety-admin","admin"),("operator","biosafety-operator","operator"),("safety","biosafety-officer","safety_officer")):
             try:self.auth.create_user(uid,pwd,role)
             except Exception:pass
     def register_zone_record(self,token,zone_record):
@@ -37,7 +48,11 @@ class BiosafetyService:
         actor=self.auth.require(token,"treatment_ticket")
         if not assignee.strip() or not 1<=priority<=5:raise ValueError("assignee and priority are invalid")
         if not self.db.execute("SELECT 1 FROM alerts WHERE alert_id=? AND zone_record_id=?",(alert_id,zone_record_id)).fetchone():raise KeyError(alert_id)
+        moment=self._moment()
         wid="wo-"+uuid.uuid4().hex[:16]
+        # 风险处置关键动作：领单处置人必须在派单时刻持有森林消防资格。
+        self.ledger.require_authorized(action="risk.dispose",user_id=assignee,business_moment=moment,
+            idempotency_key=f"risk.dispose.assign:{wid}",context={"zone_record_id":zone_record_id,"alert_id":alert_id})
         with transaction(self.db): self.db.execute("INSERT INTO treatment_tickets VALUES(?,?,?,?,?,?,?,?)",(wid,zone_record_id,alert_id,assignee,"open",priority,utcnow(),utcnow())); audit(self.db,"treatment_ticket",wid,"created",actor.user_id,{"zone_record_id":zone_record_id,"alert_id":alert_id})
         return self.treatment_ticket(token,wid)
     def treatment_ticket(self,token,treatment_ticket_id):
@@ -47,11 +62,19 @@ class BiosafetyService:
     def transition_treatment_ticket(self,token,treatment_ticket_id,target,reason):
         actor=self.auth.require(token,"treatment_ticket"); allowed={"open":{"assigned","cancelled"},"assigned":{"in_progress","cancelled"},"in_progress":{"completed","blocked"},"blocked":{"in_progress","cancelled"},"completed":set(),"cancelled":set()}
         if not reason.strip():raise ValueError("transition reason is required")
+        row=self.db.execute("SELECT status,assignee FROM treatment_tickets WHERE treatment_ticket_id=?",(treatment_ticket_id,)).fetchone()
+        if not row:raise KeyError(treatment_ticket_id)
+        if target not in allowed.get(row[0],set()):raise ValueError("invalid work order transition")
+        if target=="in_progress":
+            # 风险处置关键动作：开始处置的时刻仍须持有有效森林消防资格。
+            # 核对在业务事务外落库，即使工单状态随后变化，拒绝事实也保留。
+            self.ledger.require_authorized(action="risk.dispose",user_id=row["assignee"],business_moment=self._moment(),
+                idempotency_key=f"risk.dispose.start:{treatment_ticket_id}",context={"treatment_ticket_id":treatment_ticket_id})
         with transaction(self.db):
-            row=self.db.execute("SELECT status FROM treatment_tickets WHERE treatment_ticket_id=?",(treatment_ticket_id,)).fetchone()
-            if not row:raise KeyError(treatment_ticket_id)
-            if target not in allowed.get(row[0],set()):raise ValueError("invalid work order transition")
-            self.db.execute("UPDATE treatment_tickets SET status=?,updated_at=? WHERE treatment_ticket_id=?",(target,utcnow(),treatment_ticket_id)); audit(self.db,"treatment_ticket",treatment_ticket_id,"transition",actor.user_id,{"from":row[0],"to":target,"reason":reason})
+            current=self.db.execute("SELECT status FROM treatment_tickets WHERE treatment_ticket_id=?",(treatment_ticket_id,)).fetchone()
+            if not current:raise KeyError(treatment_ticket_id)
+            if target not in allowed.get(current[0],set()):raise ValueError("invalid work order transition")
+            self.db.execute("UPDATE treatment_tickets SET status=?,updated_at=? WHERE treatment_ticket_id=?",(target,utcnow(),treatment_ticket_id)); audit(self.db,"treatment_ticket",treatment_ticket_id,"transition",actor.user_id,{"from":current[0],"to":target,"reason":reason})
         return self.treatment_ticket(token,treatment_ticket_id)
     def add_preservation_resource(self,token,preservation_resource_id,kind,collection_zone,capacity):
         actor=self.auth.require(token,"admin")
@@ -65,6 +88,11 @@ class BiosafetyService:
     def allocate(self,token,preservation_resource_id,treatment_ticket_id,quantity):
         actor=self.auth.require(token,"allocate")
         if quantity<=0:raise ValueError("quantity must be positive")
+        moment=self._moment()
+        # 资源调拨关键动作：调拨人必须持有有效森林消防资格。
+        self.ledger.require_authorized(action="resource.allocate",user_id=actor.user_id,business_moment=moment,
+            idempotency_key=f"resource.allocate:{preservation_resource_id}:{treatment_ticket_id}",
+            context={"preservation_resource_id":preservation_resource_id,"treatment_ticket_id":treatment_ticket_id,"quantity":quantity})
         aid="alloc-"+uuid.uuid4().hex[:16]
         with transaction(self.db):
             preservation_resource=self.db.execute("SELECT available FROM preservation_resources WHERE preservation_resource_id=?",(preservation_resource_id,)).fetchone()
@@ -76,3 +104,21 @@ class BiosafetyService:
             self.db.execute("INSERT INTO allocations VALUES(?,?,?,?,?)",(aid,preservation_resource_id,treatment_ticket_id,quantity,utcnow())); self.db.execute("UPDATE preservation_resources SET available=available-? WHERE preservation_resource_id=?",(quantity,preservation_resource_id)); audit(self.db,"preservation_resource",preservation_resource_id,"allocated",actor.user_id,{"treatment_ticket_id":treatment_ticket_id,"quantity":quantity})
         return {"plan_id":aid,"duplicate":False,"preservation_resource_id":preservation_resource_id,"quantity":quantity}
     def audit_events(self,token,entity_type,entity_id): self.auth.require(token,"read"); return rows(self.db,"SELECT * FROM audit_events WHERE entity_type=? AND entity_id=? ORDER BY event_id",(entity_type,entity_id))
+    # ------------------------------------------------------------------ #
+    # 资格事件账本
+    # ------------------------------------------------------------------ #
+    def record_qualification_event(self,token,payload):
+        actor=self.auth.require(token,"qualification.manage")
+        data=dict(payload); data["recorded_by"]=actor.user_id
+        with transaction(self.db):
+            event=self.ledger.record_event(**data)
+            audit(self.db,"qualification",data.get("user_id"),"qualification."+event["event_type"],actor.user_id,{"event_id":event["event_id"]})
+        return event
+    def qualification(self,token,user_id,competency=None,as_of=None):
+        self.auth.require(token,"read")
+        if competency:return self.ledger.qualification(user_id,competency,as_of)
+        return self.ledger.projection(user_id,as_of).as_dict()
+    def qualification_events(self,token,user_id):
+        self.auth.require(token,"read"); return self.ledger.events(user_id)
+    def qualification_chain(self,token):
+        self.auth.require(token,"read"); return self.ledger.verify_chain()

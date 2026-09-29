@@ -15,15 +15,22 @@ from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFaile
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
 
+from qualification_ledger import (
+    COMPETENCY_SPECIMEN_REVIEW,
+    TASK_FAMILY_COMPETENCIES,
+    QualificationDenied,
+    QualificationLedger,
+)
+
 
 ROLE_PERMISSIONS = {
     "operator": {
         "catalog.write", "batch.create", "batch.start", "evidence_item.import",
         "exclusion.request", "exclusion.revoke",
     },
-    "statistician": {"evidence_protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
+    "statistician": {"evidence_protocol.publish", "batch.seal", "exclusion.review", "analysis.run", "qualification.manage", "qualification.read"},
     "approver": {"decision.write"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "qualification.read"},
 }
 
 
@@ -34,6 +41,11 @@ class TaxonomyLabService:
         self.connection = connection
         self.clock = clock or SystemClock()
         initialize(connection)
+        self.ledger = QualificationLedger(connection, self.clock)
+
+    def set_clock(self, clock) -> None:
+        self.clock = clock
+        self.ledger.set_clock(clock)
 
     def _now(self) -> str:
         return isoformat(self.clock.now())
@@ -294,12 +306,21 @@ class TaxonomyLabService:
         if row["requested_by"] == actor_id:
             raise Forbidden("申请人不能复核自己的排除申请")
         status = "approved" if approve else "rejected"
+        # 样本复核关键动作：复核人在复核时刻必须持有样本复核资格。
+        # 核对在业务事务外落库，即使复核因状态竞争未写入，核对事实仍保留。
+        self.ledger.require_authorized(
+            action="specimen.review", user_id=actor_id,
+            business_moment=self._now(), idempotency_key=f"specimen.review:{exclusion_id}",
+            context={"exclusion_id": exclusion_id, "decision": status},
+        )
         with transaction(self.connection, immediate=True):
-            self.connection.execute(
+            cursor = self.connection.execute(
                 "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
                 "WHERE exclusion_id=? AND status='pending'",
                 (status, actor_id, self._now(), note, exclusion_id),
             )
+            if cursor.rowcount != 1:
+                raise InvalidState("排除申请状态已变化")
             self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note})
         return {"exclusion_id": exclusion_id, "status": status}
 
@@ -367,20 +388,40 @@ class TaxonomyLabService:
             raise ValidationFailed("租约时长必须大于零")
         now = self._now()
         expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
+        # 候选任务先在事务外读取；资格核对作为独立事实落库，即使后续领取
+        # 因并发或资格不足未发生，核对记录仍然保留。
+        row = self.connection.execute(
+            "SELECT job_id,batch_id FROM analysis_jobs WHERE "
+            "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
+            "ORDER BY available_at,job_id LIMIT 1",
+            (now, now),
+        ).fetchone()
+        if row is None:
+            return None
+        family = self.connection.execute(
+            "SELECT p.task_family FROM batches b "
+            "JOIN evidence_protocol_catalog p "
+            "ON p.evidence_protocol_id=b.evidence_protocol_id AND p.version=b.evidence_protocol_version "
+            "WHERE b.batch_id=?",
+            (row["batch_id"],),
+        ).fetchone()[0]
+        required = TASK_FAMILY_COMPETENCIES.get(family, frozenset({COMPETENCY_SPECIMEN_REVIEW}))
+        # 任务领取关键动作：领取人在领取时刻必须持有该任务族所需资格。
+        self.ledger.require_authorized(
+            action="job.claim", user_id=worker_id, required_competencies=required,
+            business_moment=now, context={"job_id": row["job_id"], "batch_id": row["batch_id"],
+                                          "task_family": family, "attempt_lease_seconds": lease_seconds},
+        )
         with transaction(self.connection, immediate=True):
-            row = self.connection.execute(
-                "SELECT job_id FROM analysis_jobs WHERE "
-                "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
-                "ORDER BY available_at,job_id LIMIT 1",
-                (now, now),
-            ).fetchone()
-            if row is None:
-                return None
-            self.connection.execute(
+            cursor = self.connection.execute(
                 "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,updated_at=? "
-                "WHERE job_id=?",
-                (worker_id, expires, now, row["job_id"]),
+                "WHERE job_id=? AND ((state='queued' AND available_at<=?) "
+                "OR (state='leased' AND lease_expires_at<=?))",
+                (worker_id, expires, now, row["job_id"], now, now),
             )
+            if cursor.rowcount != 1:
+                # 任务已被其他合格领取人抢走。
+                return None
             claimed = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)).fetchone()
         return dict(claimed)
 
@@ -513,6 +554,45 @@ class TaxonomyLabService:
         except sqlite3.IntegrityError as exc:
             raise Conflict("该分析版本已经形成决定") from exc
         return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision}
+
+    def audit_events(self, entity_type: str, entity_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(row) | {"payload": json.loads(row["payload_json"])}
+            for row in self.connection.execute(
+                "SELECT * FROM audit_events WHERE entity_type=? AND entity_id=? ORDER BY event_id",
+                (entity_type, entity_id),
+            ).fetchall()
+        ]
+
+    # ------------------------------------------------------------------ #
+    # 资格事件账本
+    # ------------------------------------------------------------------ #
+    def record_qualification_event(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "qualification.manage")
+        payload = dict(raw)
+        payload["recorded_by"] = actor_id
+        event = self.ledger.record_event(**payload)
+        self._audit(
+            "qualification", payload.get("user_id", ""),
+            f"qualification.{event['event_type']}", actor_id,
+            {"event_id": event["event_id"], "competency_code": event["competency_code"], "scope": event["scope"]},
+        )
+        return event
+
+    def qualification(self, actor_id: str, user_id: str, competency: str | None = None,
+                      as_of: str | None = None) -> dict[str, Any]:
+        self._require(actor_id, "qualification.read")
+        if competency is not None:
+            return self.ledger.qualification(user_id, competency, as_of)
+        return self.ledger.projection(user_id, as_of).as_dict()
+
+    def qualification_events(self, actor_id: str, user_id: str) -> list[dict[str, Any]]:
+        self._require(actor_id, "qualification.read")
+        return self.ledger.events(user_id)
+
+    def qualification_chain(self, actor_id: str) -> dict[str, Any]:
+        self._require(actor_id, "qualification.read")
+        return self.ledger.verify_chain()
 
     def report(self, actor_id: str, batch_id: str) -> dict[str, Any]:
         user = self._user(actor_id)

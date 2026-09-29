@@ -29,12 +29,18 @@ from .planning import (
 )
 from .storage import initialize, transaction
 
+from qualification_ledger import (
+    COMPETENCY_FOREST_FIRE,
+    RESOURCE_KIND_COMPETENCIES,
+    QualificationLedger,
+)
+
 
 ROLE_PERMISSIONS = {
     "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run"},
     "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "risk": {"outage.write", "scenario.approve", "report.read", "qualification.manage", "qualification.read"},
+    "auditor": {"report.read", "audit.read", "qualification.read"},
 }
 
 
@@ -43,6 +49,11 @@ class CollectionLogisticsService:
         self.connection = connection
         self.clock = clock or SystemClock()
         initialize(connection)
+        self.ledger = QualificationLedger(connection, self.clock)
+
+    def set_clock(self, clock) -> None:
+        self.clock = clock
+        self.ledger.set_clock(clock)
 
     def _now(self) -> str:
         return utc_text(self.clock.now())
@@ -425,6 +436,16 @@ class CollectionLogisticsService:
         lot = self.connection.execute("SELECT * FROM preservation_resource_lots WHERE preservation_resource_lot_id=?", (preservation_resource_lot_id,)).fetchone()
         if lot is None:
             raise NotFound("应急资源批次不存在")
+        required_kind = RESOURCE_KIND_COMPETENCIES.get(
+            lot["preservation_resource_kind"], frozenset({COMPETENCY_FOREST_FIRE})
+        )
+        # 资源调拨关键动作：实际到场调拨时，调拨人须持有该资源类型对应的有效资格。
+        self.ledger.require_authorized(
+            action="resource.allocate", user_id=actor_id, required_competencies=required_kind,
+            business_moment=self._now(), idempotency_key=f"resource.allocate.deploy:{deployment_id}",
+            context={"dispatch_id": dispatch_id, "preservation_resource_lot_id": preservation_resource_lot_id,
+                     "preservation_resource_kind": lot["preservation_resource_kind"]},
+        )
         allocated = Decimal(dispatch_request["allocated_units"])
         available = Decimal(lot["available_units"])
         if lot["center_id"] != dispatch_request["origin_center_id"] or lot["preservation_resource_kind"] != self.route(dispatch_request["corridor_id"])["preservation_resource_kind"]:
@@ -569,3 +590,33 @@ class CollectionLogisticsService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    # ------------------------------------------------------------------ #
+    # 资格事件账本
+    # ------------------------------------------------------------------ #
+    def record_qualification_event(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "qualification.manage")
+        payload = dict(raw)
+        payload["recorded_by"] = actor_id
+        event = self.ledger.record_event(**payload)
+        self._audit(
+            "qualification", payload.get("user_id", ""),
+            f"qualification.{event['event_type']}", actor_id,
+            {"event_id": event["event_id"], "competency_code": event["competency_code"], "scope": event["scope"]},
+        )
+        return event
+
+    def qualification(self, actor_id: str, user_id: str, competency: str | None = None,
+                      as_of: str | None = None) -> dict[str, Any]:
+        self._require(actor_id, "qualification.read")
+        if competency is not None:
+            return self.ledger.qualification(user_id, competency, as_of)
+        return self.ledger.projection(user_id, as_of).as_dict()
+
+    def qualification_events(self, actor_id: str, user_id: str) -> list[dict[str, Any]]:
+        self._require(actor_id, "qualification.read")
+        return self.ledger.events(user_id)
+
+    def qualification_chain(self, actor_id: str) -> dict[str, Any]:
+        self._require(actor_id, "qualification.read")
+        return self.ledger.verify_chain()

@@ -37,6 +37,13 @@ class ServiceTests(unittest.TestCase):
         self.service.register_device("operator", "scope-a", "A 型", "厂商")
         self.service.register_build("operator", "build-a", "scope-a", "1.0", "b" * 64)
         self.service.publish_evidence_protocol("stat", self.evidence_protocol)
+        # 任务领取人与样本复核人需持有样本复核培训资格。
+        for worker in ("worker", "worker-a", "worker-b", "stat"):
+            self.service.record_qualification_event("stat", {
+                "user_id": worker, "event_type": "training_passed",
+                "competency_code": "specimen-review", "scope": "taxonomy-review-basic",
+                "valid_from": "2026-09-01T00:00:00Z", "idempotency_key": f"{worker}-review-train",
+            })
         self.service.create_batch("operator", "batch-a", "demo-taxonomy-v1", 1, "build-a")
         self.service.start_batch("operator", "batch-a", 1)
 

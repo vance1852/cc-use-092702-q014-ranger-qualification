@@ -14,6 +14,8 @@ from .errors import CollectionDispatchError, ValidationFailed
 from .service import CollectionLogisticsService
 from .storage import connect
 
+from qualification_ledger import QualificationDenied
+
 
 @dataclass(frozen=True, slots=True)
 class Response:
@@ -85,7 +87,18 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            if method == "POST" and path == "/qualification_events":
+                return Response(201, self.service.record_qualification_event(actor, payload))
+            if method == "GET" and path == "/qualifications/chain":
+                return Response(200, self.service.qualification_chain(actor))
+            if method == "GET" and len(parts) == 3 and parts[0] == "qualifications" and parts[2] == "events":
+                return Response(200, {"events": self.service.qualification_events(actor, parts[1])})
+            if method == "GET" and len(parts) == 2 and parts[0] == "qualifications":
+                return Response(200, self.service.qualification(
+                    actor, parts[1], query.get("competency", [None])[0], query.get("as_of", [None])[0]))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
+        except QualificationDenied as exc:
+            return Response(403, {"error": {"code": "qualification_denied", "message": str(exc)}})
         except CollectionDispatchError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:

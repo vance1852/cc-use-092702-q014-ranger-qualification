@@ -9,11 +9,13 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .errors import ServiceError, ValidationFailed
 from .service import TaxonomyLabService
 from .storage import connect
+
+from qualification_ledger import QualificationDenied
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +53,9 @@ class JsonApplication:
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
-        path = urlparse(target).path.rstrip("/") or "/"
+        parsed = urlparse(target)
+        path = parsed.path.rstrip("/") or "/"
+        query = parse_qs(parsed.query)
         parts = [part for part in path.split("/") if part]
         try:
             if method == "GET" and path == "/health":
@@ -133,7 +137,21 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            if method == "POST" and path == "/qualification_events":
+                return Response(201, self.service.record_qualification_event(
+                    self._actor(normalized_headers), payload))
+            if method == "GET" and path == "/qualifications/chain":
+                return Response(200, self.service.qualification_chain(self._actor(normalized_headers)))
+            if method == "GET" and len(parts) == 3 and parts[0] == "qualifications" and parts[2] == "events":
+                actor = self._actor(normalized_headers)
+                return Response(200, {"events": self.service.qualification_events(actor, parts[1])})
+            if method == "GET" and len(parts) == 2 and parts[0] == "qualifications":
+                actor = self._actor(normalized_headers)
+                return Response(200, self.service.qualification(
+                    actor, parts[1], query.get("competency", [None])[0], query.get("as_of", [None])[0]))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
+        except QualificationDenied as exc:
+            return Response(403, {"error": {"code": "qualification_denied", "message": str(exc)}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
